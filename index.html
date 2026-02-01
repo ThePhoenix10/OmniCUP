@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tumor Origin Prediction</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Tumor Origin Prediction</h1>
+        </div>
+
+        <div class="tabs">
+            <button class="tab-button active" onclick="switchTab('prediction', event)">Prediction</button>
+            <button class="tab-button" onclick="switchTab('therapy', event)">Therapy</button>
+        </div>
+
+        <div id="statusMessage" class="status-message"></div>
+        <div id="loading" class="loading"></div>
+
+        <div id="prediction-tab" class="tab-content active">
+            <h2>Patient Information</h2>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="age">Age</label>
+                    <input type="number" id="age" placeholder="Enter age" min="0" max="150">
+                </div>
+                <div class="form-group">
+                    <label for="sex">Sex</label>
+                    <select id="sex">
+                        <option value="">Select...</option>
+                        <option value="Female">Female</option>
+                        <option value="Male">Male</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="tmb">Tumor Mutational Burden (TMB)</label>
+                    <input type="text" id="tmb" placeholder="e.g., 10.5">
+                </div>
+                <div class="form-group">
+                    <label for="msi">MSI Score</label>
+                    <input type="text" id="msi" placeholder="e.g., 0.85">
+                </div>
+            </div>
+
+            <h2>Add Altered Gene</h2>
+            <div class="autocomplete-wrapper">
+                <input 
+                    type="text" 
+                    id="geneInput" 
+                    class="autocomplete-input" 
+                    placeholder="Start typing gene name (e.g., TP53, BRCA1)..."
+                    autocomplete="off">
+                <div id="geneList" class="autocomplete-list"></div>
+            </div>
+
+            <h2>Gene Alterations</h2>
+            <div class="table-wrapper">
+                <table id="geneTable">
+                    <thead>
+                        <tr>
+                            <th>Gene Name</th>
+                            <th>
+                                <div class="info-wrapper">
+                                    <span>LOF</span>
+                                    <span class="info-icon">i</span>
+                                    <div class="info-tooltip">
+                                        Loss of Function:<br><br>
+                                        • Nonsense Mutation<br>
+                                        • Frame Shift Insertion<br>
+                                        • Frame Shift Deletion<br>
+                                        • Splice Site<br>
+                                        • Translation Start Site
+                                    </div>
+                                </div>
+                            </th>
+                            <th>
+                                <div class="info-wrapper">
+                                    <span>Non-LOF</span>
+                                    <span class="info-icon">i</span>
+                                    <div class="info-tooltip">
+                                        Non-Loss of Function:<br><br>
+                                        • Missense Mutation<br>
+                                        • In Frame Insertion<br>
+                                        • In Frame Deletion<br>
+                                        • Nonstop Mutation
+                                    </div>
+                                </div>
+                            </th>
+                            <th>CNA Amp</th>
+                            <th>CNA Del</th>
+                            <th>Fusion</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="geneTableBody">
+                        <tr class="empty-state">
+                            <td colspan="7">No genes added yet. Search and select a gene above.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h2>Allele-Level Hotspots</h2>
+            <div class="autocomplete-wrapper">
+                <input 
+                    type="text" 
+                    id="hotspotInput" 
+                    class="autocomplete-input" 
+                    placeholder="Search hotspot (e.g., TP53.R175H, KRAS.G12C)..."
+                    autocomplete="off">
+                <div id="hotspotList" class="autocomplete-list"></div>
+            </div>
+            <div id="hotspotBadges" class="hotspot-list">
+                <span class="empty-state">No hotspots selected yet.</span>
+            </div>
+
+            <h2>Distant Metastatic Sites (DMETS)</h2>
+            <p style="color: #6b7280; margin-bottom: 15px; font-size: 14px;">Select all metastatic sites, or choose "Unspecified Site" if a location is not listed.</p>
+            <div class="dmets-grid" id="dmetsGrid">
+            </div>
+
+            <div class="divider"></div>
+            <h2>Predictions</h2>
+            <button class="btn btn-primary" onclick="submitData()">Get Tumor Origin Prediction</button>
+            
+            <div id="resultsContainer" style="display: none;">
+                <div class="summary">
+                    <h3>Top Predictions</h3>
+                    <div id="predictionsList"></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="therapy-tab" class="tab-content">
+            <h2>Therapy</h2>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="therapyGene">Gene</label>
+                    <input type="text" id="therapyGene" placeholder="Please enter the gene">
+                </div>
+                <div class="form-group">
+                    <label for="therapyCancerType">Cancer Type</label>
+                    <input type="text" id="therapyCancerType" placeholder="Please enter the cancer type">
+                </div>
+            </div>
+            
+            <div style="text-align: center; margin-top: 24px;">
+                <button class="btn btn-primary" onclick="submitTherapyLookup()">Search Therapies</button>
+            </div>
+            
+            <div id="therapyResultsContainer" style="display: none; margin-top: 24px;">
+                <div class="summary">
+                    <h3>Therapies from CIVIC Database</h3>
+                    <div id="therapyResults"></div>
+                </div>
+            </div>
+            
+            <div id="therapyLoadingContainer" style="display: none; text-align: center; margin-top: 24px;">
+                <div class="loading show"></div>
+            </div>
+            
+            <div id="therapyErrorContainer" style="display: none; margin-top: 24px;">
+                <div class="status-message error" id="therapyErrorMessage"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
