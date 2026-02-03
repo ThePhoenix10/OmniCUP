@@ -9,8 +9,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-os.environ["OPENAI_API_KEY"] = "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"
-
 from openai import OpenAI
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
