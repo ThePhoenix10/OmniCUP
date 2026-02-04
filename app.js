@@ -433,7 +433,6 @@ function submitData() {
         showLoading(false);
         
         if (result.status === 'success') {
-            showStatus('Prediction successful', 'success');
             displayPredictions(result.predictions);
         } else {
             showStatus(`Error: ${result.message}`, 'error');
