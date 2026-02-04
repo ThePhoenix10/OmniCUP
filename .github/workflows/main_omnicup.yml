@@ -14,25 +14,59 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      # IMPORTANT: Pull Git LFS files (your models are very likely stored in LFS)
+      - name: Checkout repository (with Git LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+
+      - name: Ensure Git LFS objects are present
+        run: |
+          git lfs install
+          git lfs pull
+          git lfs ls-files || true
+
+      # Optional but strongly recommended: fail fast if model files are still LFS pointers
+      - name: Validate model files are not LFS pointer files
+        run: |
+          set -e
+          check_pointer () {
+            f="$1"
+            if [ -f "$f" ]; then
+              first_line="$(head -n 1 "$f" || true)"
+              echo "First line of $f: $first_line"
+              if echo "$first_line" | grep -qi "^version https://git-lfs.github.com/spec/v1"; then
+                echo "ERROR: $f is a Git LFS pointer file, not the real binary."
+                echo "Fix: ensure the file is tracked by LFS and that LFS is pulled during checkout."
+                exit 1
+              fi
+            else
+              echo "WARNING: $f not found in repo root at build time."
+            fi
+          }
+
+          # Adjust names if your repo uses different paths
+          check_pointer "xgb_model.json"
+          check_pointer "mlp_model.pt"
+          check_pointer "ensemble_info.pkl"
+          check_pointer "label_encoder.pkl"
 
       - name: Set up Python version
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
 
-      # 🛠️ Local Build Section (Optional)
-      # The following section in your workflow is designed to catch build issues early on the client side, before deployment. This can be helpful for debugging and validation. However, if this step significantly increases deployment time and early detection is not critical for your workflow, you may remove this section to streamline the deployment process.
-      - name: Create and Start virtual environment and Install dependencies
+      # OPTIONAL: Keep this only if you want to catch dependency issues in CI.
+      # If your requirements.txt is still being fixed, you can remove this section.
+      - name: Install dependencies (CI validation)
         run: |
-          python -m venv antenv
-          source antenv/bin/activate
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-                
-      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size. 
+
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -41,25 +75,19 @@ jobs:
             .
             !antenv/
 
-      # 🚫 Opting Out of Oryx Build
-      # If you prefer to disable the Oryx build process during deployment, follow these steps:
-      # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
-      # 2. Refer to sample workflows for alternative deployment strategies: https://github.com/Azure/actions-workflow-samples/tree/master/AppService
-      
-
   deploy:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
+      id-token: write
+      contents: read
 
     steps:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -67,10 +95,10 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_489DCC1FC2EA4DADBC58734E62F2AC71 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_A533C0ABC23D47FB8A057691CCA4D82E }}
 
-      - name: 'Deploy to Azure Web App'
+      - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
-          app-name: 'OmniCUP'
-          slot-name: 'Production'
-          
+          app-name: "OmniCUP"
+          slot-name: "Production"
+          package: .
