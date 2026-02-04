@@ -29,6 +29,21 @@ CORS(app)
 def index():
     return send_from_directory(".", "index.html")
 
+def flush():
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+print("App starting")
+print(f"Working directory: {os.getcwd()}")
+print("Directory listing (top-level):")
+try:
+    print(os.listdir("."))
+except Exception as e:
+    print(f"Could not list directory: {e}")
+flush()
+
 print("Loading CIVIC database")
 CIVIC_DF = None
 query_engine = None
@@ -45,7 +60,7 @@ try:
 
     if CIVIC_DF is not None:
         print(f"Columns: {CIVIC_DF.columns.tolist()}")
-        
+
         query_engine = PandasQueryEngine(
             df=CIVIC_DF,
             verbose=False,
@@ -68,9 +83,9 @@ except Exception as e:
     print(f"Error loading CIVIC database: {e}")
     CIVIC_DF = None
     query_engine = None
+flush()
 
 def load_hotspots_from_csv(filepath):
-    """Load hotspots from Allele_Level_Hotspot_Feature_Names.csv"""
     try:
         df = pd.read_csv(filepath)
         if 'ALLELE_HOTSPOT_FEATURE' in df.columns:
@@ -85,13 +100,12 @@ def load_hotspots_from_csv(filepath):
         return []
 
 def load_genes_from_ensemble_info(filepath):
-    """Load genes from ensemble_info.pkl by extracting columns ending with genomic alteration types"""
     try:
-        ensemble_info = joblib.load(filepath)
-        feature_columns = ensemble_info.get("feature_columns", [])
+        ensemble_info_local = joblib.load(filepath)
+        feature_cols = ensemble_info_local.get("feature_columns", [])
         genomic_suffixes = ["_NON_LOF", "_LOF", "_MUT", "_AMP", "_DEL", "_FUSION"]
         genes = set()
-        for col in feature_columns:
+        for col in feature_cols:
             for suffix in genomic_suffixes:
                 if col.endswith(suffix):
                     gene = col[:-len(suffix)]
@@ -117,13 +131,14 @@ try:
     FEATURE_SET = set(feature_columns)
     print(f"Loaded ensemble_info.pkl with {len(feature_columns)} features")
 except Exception as e:
-    print(f"ensemble_info.pkl not found: {e}")
+    print(f"ensemble_info.pkl not loaded: {e}")
 
 try:
     label_encoder = joblib.load("label_encoder.pkl")
     print(f"Label encoder loaded with {len(label_encoder.classes_)} classes")
 except Exception as e:
-    print(f"label_encoder.pkl not found: {e}")
+    print(f"label_encoder.pkl not loaded: {e}")
+flush()
 
 print("Loading XGBoost booster")
 xgb_model = None
@@ -132,7 +147,9 @@ try:
     xgb_model.load_model("xgb_model.json")
     print("XGBoost loaded successfully")
 except Exception as e:
-    print(f"XGBoost model not found: {e}")
+    print(f"XGBoost model not loaded: {e}")
+    xgb_model = None
+flush()
 
 class MLP(nn.Module):
     def __init__(self, d, c):
@@ -164,11 +181,32 @@ try:
     mlp_model.eval()
     print("MLP loaded successfully")
 except Exception as e:
-    print(f"MLP model not found: {e}")
+    print(f"MLP model not loaded: {e}")
+    mlp_model = None
+flush()
+
+@app.route("/api/model-status", methods=["GET"])
+def model_status():
+    status = {
+        "xgb_loaded": xgb_model is not None,
+        "mlp_loaded": mlp_model is not None,
+        "label_encoder_loaded": label_encoder is not None,
+        "feature_columns_count": len(feature_columns) if feature_columns is not None else 0,
+        "cwd": os.getcwd(),
+        "files_present": {
+            "ensemble_info.pkl": os.path.exists("ensemble_info.pkl"),
+            "label_encoder.pkl": os.path.exists("label_encoder.pkl"),
+            "xgb_model.json": os.path.exists("xgb_model.json"),
+            "mlp_model.pt": os.path.exists("mlp_model.pt"),
+            "Allele_Level_Hotspot_Feature_Names.csv": os.path.exists("Allele_Level_Hotspot_Feature_Names.csv"),
+            "Civic.xlsx": os.path.exists("Civic.xlsx"),
+            "Civic.csv": os.path.exists("Civic.csv"),
+        }
+    }
+    return jsonify(status)
 
 @app.route("/api/data", methods=["GET"])
 def get_data():
-    """Return genes, hotspots, and ensemble weights for frontend"""
     hotspots = load_hotspots_from_csv("Allele_Level_Hotspot_Feature_Names.csv")
     genes = load_genes_from_ensemble_info("ensemble_info.pkl")
 
@@ -183,11 +221,10 @@ def get_data():
 
 @app.route("/api/debug-patient", methods=["POST"])
 def debug_patient():
-    """Receives patient data and prints to terminal"""
     data = request.json
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Patient Data Submitted")
-    print("="*60)
+    print("=" * 60)
     print("\nClinical Data:")
     c = data.get("Clinical", {})
     if c.get("Age"):
@@ -222,27 +259,19 @@ def debug_patient():
                 print(f"{dmet}: 1")
     else:
         print("(none)")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
+    flush()
     return jsonify({"status": "logged"})
 
 def parse_comma_delimited_genes(gene_input):
-    """Parse comma-delimited gene input like 'BRAF V600, NRAS Q61'"""
     if not gene_input:
         return []
-    
     genes = [g.strip() for g in gene_input.split(",")]
     genes = [g for g in genes if g]
     return genes
 
 @app.route("/api/therapy-lookup", methods=["POST"])
 def therapy_lookup():
-    """
-    ENHANCED ARCHITECTURE:
-    1. Parse comma-delimited genes (e.g., 'BRAF V600, NRAS Q61')
-    2. Query for EACH gene separately with the cancer type
-    3. Generate ONE 2-sentence summary per gene
-    4. Combine all results
-    """
     try:
         if CIVIC_DF is None or query_engine is None:
             return jsonify({
@@ -251,12 +280,13 @@ def therapy_lookup():
             }), 500
 
         data = request.json
-        
-        print("\n" + "="*60)
+
+        print("\n" + "=" * 60)
         print("Therapy Lookup Debug Request")
-        print("="*60)
+        print("=" * 60)
         print(f"Raw request data: {data}")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
+        flush()
 
         cancer_type = data.get("cancer_type", "").strip() if isinstance(data.get("cancer_type"), str) else ""
         if not cancer_type:
@@ -267,6 +297,7 @@ def therapy_lookup():
 
         print(f"Parsed cancer_type: {cancer_type}")
         print(f"Parsed molecular_alterations: {molecular_alterations}\n")
+        flush()
 
         if not cancer_type:
             return jsonify({
@@ -281,13 +312,15 @@ def therapy_lookup():
             }), 400
 
         print("Querying CIVIC database for each gene and generating summaries\n")
-        
+        flush()
+
         all_summaries = ""
         all_results_text = ""
-        
+
         for gene in molecular_alterations:
             print(f"\nProcessing: {gene} + {cancer_type}")
-            
+            flush()
+
             query = f"""
 A patient has the following molecular alteration:
 {gene}
@@ -315,17 +348,19 @@ Using ONLY the dataframe provided:
 6. Set pandas display options to show all rows: pd.set_option('display.max_rows', None) and pd.set_option('display.max_colwidth', None)
 """
 
-            print(f"Query sent to PandasQueryEngine\n")
-            
+            print("Query sent to PandasQueryEngine")
+            flush()
+
             try:
                 response = query_engine.query(query)
                 raw_response_text = str(response)
-                
+
                 print(f"Query successful for {gene}")
                 print(f"Response:\n{raw_response_text}\n")
-                
+                flush()
+
                 all_results_text += f"--------------------------------------------------\n{gene}\n--------------------------------------------------\n{raw_response_text}\n\n"
-                
+
                 llm_summary_prompt = f"""You are an expert oncologist. Based on these CIVIC database results, provide a brief 2-sentence summary ONLY.
 
 GENE: {gene}
@@ -342,6 +377,8 @@ Be specific. Keep it concise. Do NOT mention therapy combinations."""
 
                 try:
                     print(f"Generating summary for {gene}")
+                    flush()
+
                     llm_response = llm.chat.completions.create(
                         model="gpt-4o",
                         messages=[
@@ -350,23 +387,21 @@ Be specific. Keep it concise. Do NOT mention therapy combinations."""
                         temperature=0
                     )
                     gene_summary = llm_response.choices[0].message.content
-                    print(f"Summary generated for {gene}\n")
-                    
+                    print(f"Summary generated for {gene}")
+                    flush()
+
                     all_summaries += f"SUMMARY: {gene}\n{gene_summary}\n"
-                    
+
                 except Exception as llm_error:
-                    print(f"Could not generate summary for {gene}: {str(llm_error)}\n")
+                    print(f"Could not generate summary for {gene}: {str(llm_error)}")
+                    flush()
                     all_summaries += f"SUMMARY: {gene}\n[Summary generation failed]\n\n"
-                
+
             except Exception as query_error:
-                print(f"Query failed for {gene}: {str(query_error)}\n")
+                print(f"Query failed for {gene}: {str(query_error)}")
+                flush()
                 all_results_text += f"--------------------------------------------------\n{gene}\n--------------------------------------------------\nNo results found or query error.\n\n"
                 all_summaries += f"SUMMARY: {gene}\n[No therapies found]\n\n"
-
-        print("="*80)
-        print("Combined Results")
-        print("="*80)
-        print("="*80 + "\n")
 
         final_output = f"""--------------------------------------------------
 SUMMARIES (2 SENTENCES PER GENE)
@@ -378,7 +413,7 @@ THERAPIES FROM CIVIC DATABASE (BY GENE)
 --------------------------------------------------
 {all_results_text}
 """
-        
+
         return jsonify({
             "status": "success",
             "clinical_analysis": final_output
@@ -388,6 +423,7 @@ THERAPIES FROM CIVIC DATABASE (BY GENE)
         print(f"Error in therapy lookup: {str(e)}")
         import traceback
         traceback.print_exc()
+        flush()
         return jsonify({
             "status": "error",
             "message": str(e)
@@ -396,10 +432,23 @@ THERAPIES FROM CIVIC DATABASE (BY GENE)
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
-        if not xgb_model or not mlp_model or not label_encoder or not feature_columns:
+        missing = []
+        if xgb_model is None:
+            missing.append("xgb_model.json")
+        if mlp_model is None:
+            missing.append("mlp_model.pt")
+        if label_encoder is None:
+            missing.append("label_encoder.pkl")
+        if feature_columns is None or len(feature_columns) == 0:
+            missing.append("ensemble_info.pkl(feature_columns)")
+
+        if len(missing) > 0:
+            msg = "Models not loaded: " + ", ".join(missing)
+            print(msg)
+            flush()
             return jsonify({
                 "status": "error",
-                "message": "Models not loaded. Please ensure all model files are in the application directory."
+                "message": msg
             }), 500
 
         data = request.json
@@ -463,22 +512,23 @@ def predict():
                 features[col] = 1
 
         X = np.zeros((1, len(feature_columns)), dtype=np.float32)
-        col_idx = {c: i for i, c in enumerate(feature_columns)}
+        col_idx = {cc: i for i, cc in enumerate(feature_columns)}
         for k, v in features.items():
             if k in col_idx:
                 X[0, col_idx[k]] = v
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("Feature Vector Debug")
-        print("="*60)
-        print(f"\nTotal features in model: {len(feature_columns)}")
-        print(f"Features set to 1: {sum(X[0])}")
-        print("\nNon-zero features:")
+        print("=" * 60)
+        print(f"Total features in model: {len(feature_columns)}")
+        print(f"Features set to 1: {int(np.sum(X[0]))}")
+        print("Non-zero features:")
         for col in feature_columns:
             idx = col_idx[col]
             if X[0, idx] == 1:
                 print(f"[{idx}] {col} = 1")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
+        flush()
 
         dmatrix = xgb.DMatrix(X, nthread=1)
         xgb_proba = xgb_model.predict(dmatrix)
@@ -506,27 +556,20 @@ def predict():
         print(f"Error in prediction: {str(e)}")
         import traceback
         traceback.print_exc()
+        flush()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("OmniCUP + CIVIC Therapy Lookup Server")
-    print("="*60)
-    print(f"Access at: http://127.0.0.1:5000")
-    print("="*60 + "\n")
+    print("=" * 60)
+    print("Model files present:")
+    print(f"ensemble_info.pkl: {os.path.exists('ensemble_info.pkl')}")
+    print(f"label_encoder.pkl: {os.path.exists('label_encoder.pkl')}")
+    print(f"xgb_model.json: {os.path.exists('xgb_model.json')}")
+    print(f"mlp_model.pt: {os.path.exists('mlp_model.pt')}")
+    print("=" * 60 + "\n")
+    flush()
 
-    if not ensemble_info or not xgb_model or not mlp_model or not label_encoder:
-        print("WARNING: Some prediction models are missing")
-        print("Please ensure these files are in the app directory:")
-        print("• ensemble_info.pkl")
-        print("• label_encoder.pkl")
-        print("• xgb_model.json")
-        print("• mlp_model.pt")
-        print()
-
-    if CIVIC_DF is None:
-        print("WARNING: CIVIC database not found")
-        print("Please ensure Civic.xlsx or Civic.csv is in the app directory")
-        print()
-
-    app.run(debug=False, port=5000, host="127.0.0.1")
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(debug=False, port=port, host="0.0.0.0")
