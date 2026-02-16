@@ -20,7 +20,7 @@ import xgboost as xgb
 import pandas as pd
 from llama_index.experimental.query_engine import PandasQueryEngine
 
-llm = OpenAI(api_key="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")
+llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
