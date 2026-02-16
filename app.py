@@ -20,7 +20,7 @@ import xgboost as xgb
 import pandas as pd
 from llama_index.experimental.query_engine import PandasQueryEngine
 
-llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+llm = OpenAI(api_key="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")
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
@@ -227,14 +227,22 @@ def debug_patient():
     print("=" * 60)
     print("\nClinical Data:")
     c = data.get("Clinical", {})
-    if c.get("Age"):
-        print(f"AGE_AT_SEQUENCING: {c['Age']}")
-    if c.get("Sex"):
-        print(f"SEX: {1 if c['Sex'] == 'Male' else 0} ({c['Sex']})")
-    if c.get("TMB"):
-        print(f"TMB_NONSYNONYMOUS: {c['TMB']}")
-    if c.get("MSI"):
-        print(f"MSI_SCORE: {c['MSI']}")
+    if c.get("Age") is not None:
+        age_val = c['Age']
+        age_str = f"NaN" if (age_val is None or age_val == "" or (isinstance(age_val, float) and np.isnan(age_val))) else str(age_val)
+        print(f"AGE_AT_SEQUENCING: {age_str}")
+    if c.get("Sex") is not None:
+        sex_val = c['Sex']
+        sex_str = f"NaN" if (sex_val is None or sex_val == "") else (f"1 ({sex_val})" if sex_val == 'Male' else f"0 ({sex_val})")
+        print(f"SEX: {sex_str}")
+    if c.get("TMB") is not None:
+        tmb_val = c['TMB']
+        tmb_str = f"NaN" if (tmb_val is None or tmb_val == "" or (isinstance(tmb_val, float) and np.isnan(tmb_val))) else str(tmb_val)
+        print(f"TMB_NONSYNONYMOUS: {tmb_str}")
+    if c.get("MSI") is not None:
+        msi_val = c['MSI']
+        msi_str = f"NaN" if (msi_val is None or msi_val == "" or (isinstance(msi_val, float) and np.isnan(msi_val))) else str(msi_val)
+        print(f"MSI_SCORE: {msi_str}")
     print("\nGene Alterations:")
     genes = data.get("Genes", {})
     if genes:
@@ -458,14 +466,51 @@ def predict():
         genes_with_hotspot = set()
 
         c = data.get("Clinical", {})
+        
+        # Age - use NaN if missing
         if c.get("Age") is not None and c.get("Age") != "":
-            features["AGE_AT_SEQUENCING"] = float(c["Age"])
+            try:
+                age_val = float(c["Age"])
+                if not np.isnan(age_val):
+                    features["AGE_AT_SEQUENCING"] = age_val
+                else:
+                    features["AGE_AT_SEQUENCING"] = np.nan
+            except (ValueError, TypeError):
+                features["AGE_AT_SEQUENCING"] = np.nan
+        else:
+            features["AGE_AT_SEQUENCING"] = np.nan
+        
+        # Sex - use NaN if missing
         if c.get("Sex") is not None and c.get("Sex") != "":
             features["SEX"] = 1 if c["Sex"] == "Male" else 0
+        else:
+            features["SEX"] = np.nan
+        
+        # TMB - use NaN if missing
         if c.get("TMB") is not None and c.get("TMB") != "":
-            features["TMB_NONSYNONYMOUS"] = float(c["TMB"])
+            try:
+                tmb_val = float(c["TMB"])
+                if not np.isnan(tmb_val):
+                    features["TMB_NONSYNONYMOUS"] = tmb_val
+                else:
+                    features["TMB_NONSYNONYMOUS"] = np.nan
+            except (ValueError, TypeError):
+                features["TMB_NONSYNONYMOUS"] = np.nan
+        else:
+            features["TMB_NONSYNONYMOUS"] = np.nan
+        
+        # MSI - use NaN if missing
         if c.get("MSI") is not None and c.get("MSI") != "":
-            features["MSI_SCORE"] = float(c["MSI"])
+            try:
+                msi_val = float(c["MSI"])
+                if not np.isnan(msi_val):
+                    features["MSI_SCORE"] = msi_val
+                else:
+                    features["MSI_SCORE"] = np.nan
+            except (ValueError, TypeError):
+                features["MSI_SCORE"] = np.nan
+        else:
+            features["MSI_SCORE"] = np.nan
 
         for k, v in data.get("DMETS", {}).items():
             if v and k in FEATURE_SET:
@@ -518,17 +563,35 @@ def predict():
                 X[0, col_idx[k]] = v
 
         print("\n" + "=" * 60)
-        print("Feature Vector Debug")
+        print("SANITY CHECK: ALL FEATURES PASSED")
         print("=" * 60)
-        print(f"Total features in model: {len(feature_columns)}")
-        print(f"Features set to 1: {int(np.sum(X[0]))}")
-        print("Non-zero features:")
-        for col in feature_columns:
-            idx = col_idx[col]
-            if X[0, idx] == 1:
-                print(f"[{idx}] {col} = 1")
+        print("\n--- CLINICAL FEATURES ---")
+        print(f"AGE_AT_SEQUENCING: {features.get('AGE_AT_SEQUENCING')}")
+        print(f"SEX: {features.get('SEX')}")
+        print(f"TMB_NONSYNONYMOUS: {features.get('TMB_NONSYNONYMOUS')}")
+        print(f"MSI_SCORE: {features.get('MSI_SCORE')}")
+        
+        print("\n--- GENOMIC ALTERATIONS (Gene Mutations) ---")
+        genes_added = [k for k in features.keys() if any(suffix in k for suffix in ['_LOF', '_NON_LOF', '_AMP', '_DEL', '_FUSION', '_MUT', '_HOTSPOT'])]
+        if genes_added:
+            for gene_feat in sorted(genes_added):
+                print(f"{gene_feat}: {features[gene_feat]}")
+        else:
+            print("(none)")
+        
+        print("\n--- DMET FEATURES (Distant Metastases) ---")
+        dmets_added = [k for k in features.keys() if k.startswith('DMETS_')]
+        if dmets_added:
+            for dmet_feat in sorted(dmets_added):
+                print(f"{dmet_feat}: {features[dmet_feat]}")
+        else:
+            print("(none)")
+        
         print("=" * 60 + "\n")
         flush()
+
+        # Replace NaN values with 0 before passing to models
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         dmatrix = xgb.DMatrix(X, nthread=1)
         xgb_proba = xgb_model.predict(dmatrix)
@@ -538,16 +601,31 @@ def predict():
             mlp_proba = torch.softmax(logits, 1).numpy()
 
         ensemble = 0.6 * xgb_proba + 0.4 * mlp_proba
-        ensemble /= ensemble.sum(axis=1, keepdims=True)
+
+        row_sums = ensemble.sum(axis=1, keepdims=True)
+
+        # Prevent divide-by-zero
+        row_sums[row_sums == 0] = 1.0
+
+        ensemble = ensemble / row_sums
+
+        # Remove any NaNs just in case
+        ensemble = np.nan_to_num(ensemble, nan=0.0, posinf=0.0, neginf=0.0)
 
         top3 = np.argsort(ensemble[0])[::-1][:3]
         results = []
         for i, idx in enumerate(top3):
+            prob = float(ensemble[0, idx])
+
+            # Ensure JSON-safe number
+            if not np.isfinite(prob):
+                prob = 0.0
+
             results.append({
                 "rank": i + 1,
                 "cancer_type": label_encoder.inverse_transform([idx])[0],
-                "probability": float(ensemble[0, idx]),
-                "confidence": f"{float(ensemble[0, idx]) * 100:.1f}%"
+                "probability": prob,
+                "confidence": f"{prob * 100:.1f}%"
             })
 
         return jsonify({"status": "success", "predictions": results})

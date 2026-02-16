@@ -396,12 +396,18 @@ function submitData() {
         };
     });
 
+    // Convert empty clinical fields to null (backend converts to NaN)
+    const getClinicalValue = (inputId) => {
+        const value = document.getElementById(inputId).value;
+        return (value !== null && value !== "") ? value : null;
+    };
+
     const data = {
         Clinical: {
-            Age: document.getElementById('age').value || null,
+            Age: getClinicalValue('age'),
             Sex: document.getElementById('sex').value || null,
-            TMB: document.getElementById('tmb').value || null,
-            MSI: document.getElementById('msi').value || null
+            TMB: getClinicalValue('tmb'),
+            MSI: getClinicalValue('msi')
         },
         Genes: genesObj,
         Hotspots: Array.from(state.hotspots).sort(),
