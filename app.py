@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import xgboost as xgb
 import pandas as pd
+import shap
 from llama_index.experimental.query_engine import PandasQueryEngine
 
 llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -466,47 +467,34 @@ def predict():
         genes_with_hotspot = set()
 
         c = data.get("Clinical", {})
-        
-        # Age - use NaN if missing
+
         if c.get("Age") is not None and c.get("Age") != "":
             try:
                 age_val = float(c["Age"])
-                if not np.isnan(age_val):
-                    features["AGE_AT_SEQUENCING"] = age_val
-                else:
-                    features["AGE_AT_SEQUENCING"] = np.nan
+                features["AGE_AT_SEQUENCING"] = age_val if not np.isnan(age_val) else np.nan
             except (ValueError, TypeError):
                 features["AGE_AT_SEQUENCING"] = np.nan
         else:
             features["AGE_AT_SEQUENCING"] = np.nan
-        
-        # Sex - use NaN if missing
+
         if c.get("Sex") is not None and c.get("Sex") != "":
             features["SEX"] = 1 if c["Sex"] == "Male" else 0
         else:
             features["SEX"] = np.nan
-        
-        # TMB - use NaN if missing
+
         if c.get("TMB") is not None and c.get("TMB") != "":
             try:
                 tmb_val = float(c["TMB"])
-                if not np.isnan(tmb_val):
-                    features["TMB_NONSYNONYMOUS"] = tmb_val
-                else:
-                    features["TMB_NONSYNONYMOUS"] = np.nan
+                features["TMB_NONSYNONYMOUS"] = tmb_val if not np.isnan(tmb_val) else np.nan
             except (ValueError, TypeError):
                 features["TMB_NONSYNONYMOUS"] = np.nan
         else:
             features["TMB_NONSYNONYMOUS"] = np.nan
-        
-        # MSI - use NaN if missing
+
         if c.get("MSI") is not None and c.get("MSI") != "":
             try:
                 msi_val = float(c["MSI"])
-                if not np.isnan(msi_val):
-                    features["MSI_SCORE"] = msi_val
-                else:
-                    features["MSI_SCORE"] = np.nan
+                features["MSI_SCORE"] = msi_val if not np.isnan(msi_val) else np.nan
             except (ValueError, TypeError):
                 features["MSI_SCORE"] = np.nan
         else:
@@ -565,62 +553,43 @@ def predict():
         print("\n" + "=" * 60)
         print("SANITY CHECK: ALL FEATURES PASSED")
         print("=" * 60)
-        print("\n--- CLINICAL FEATURES ---")
         print(f"AGE_AT_SEQUENCING: {features.get('AGE_AT_SEQUENCING')}")
         print(f"SEX: {features.get('SEX')}")
         print(f"TMB_NONSYNONYMOUS: {features.get('TMB_NONSYNONYMOUS')}")
         print(f"MSI_SCORE: {features.get('MSI_SCORE')}")
-        
-        print("\n--- GENOMIC ALTERATIONS (Gene Mutations) ---")
-        genes_added = [k for k in features.keys() if any(suffix in k for suffix in ['_LOF', '_NON_LOF', '_AMP', '_DEL', '_FUSION', '_MUT', '_HOTSPOT'])]
+        genes_added = [k for k in features if any(s in k for s in ['_LOF','_NON_LOF','_AMP','_DEL','_FUSION','_MUT','_HOTSPOT'])]
         if genes_added:
-            for gene_feat in sorted(genes_added):
-                print(f"{gene_feat}: {features[gene_feat]}")
-        else:
-            print("(none)")
-        
-        print("\n--- DMET FEATURES (Distant Metastases) ---")
-        dmets_added = [k for k in features.keys() if k.startswith('DMETS_')]
+            for gf in sorted(genes_added):
+                print(f"{gf}: {features[gf]}")
+        dmets_added = [k for k in features if k.startswith('DMETS_')]
         if dmets_added:
-            for dmet_feat in sorted(dmets_added):
-                print(f"{dmet_feat}: {features[dmet_feat]}")
-        else:
-            print("(none)")
-        
+            for df in sorted(dmets_added):
+                print(f"{df}: {features[df]}")
         print("=" * 60 + "\n")
         flush()
 
-        # Replace NaN values with 0 before passing to models
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        # Replace NaN before model inference
+        X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-        dmatrix = xgb.DMatrix(X, nthread=1)
+        dmatrix = xgb.DMatrix(X_clean, nthread=1)
         xgb_proba = xgb_model.predict(dmatrix)
 
         with torch.no_grad():
-            logits = mlp_model(torch.from_numpy(X))
+            logits = mlp_model(torch.from_numpy(X_clean))
             mlp_proba = torch.softmax(logits, 1).numpy()
 
         ensemble = 0.6 * xgb_proba + 0.4 * mlp_proba
-
         row_sums = ensemble.sum(axis=1, keepdims=True)
-
-        # Prevent divide-by-zero
         row_sums[row_sums == 0] = 1.0
-
         ensemble = ensemble / row_sums
-
-        # Remove any NaNs just in case
         ensemble = np.nan_to_num(ensemble, nan=0.0, posinf=0.0, neginf=0.0)
 
-        top3 = np.argsort(ensemble[0])[::-1][:3]
+        all_sorted = np.argsort(ensemble[0])[::-1]
         results = []
-        for i, idx in enumerate(top3):
+        for i, idx in enumerate(all_sorted):
             prob = float(ensemble[0, idx])
-
-            # Ensure JSON-safe number
             if not np.isfinite(prob):
                 prob = 0.0
-
             results.append({
                 "rank": i + 1,
                 "cancer_type": label_encoder.inverse_transform([idx])[0],
@@ -628,7 +597,76 @@ def predict():
                 "confidence": f"{prob * 100:.1f}%"
             })
 
-        return jsonify({"status": "success", "predictions": results})
+        shap_by_class = {}
+        try:
+            # XGBoost native SHAP — (1, n_classes, n_features+1)
+            xgb_shap_raw = xgb_model.predict(
+                xgb.DMatrix(X_clean, nthread=1),
+                pred_contribs=True
+            )
+            print(f"XGBoost SHAP raw shape: {xgb_shap_raw.shape}")
+
+            num_classes_local = len(label_encoder.classes_)
+
+            # MLP SHAP for all classes at once
+            background   = torch.zeros(1, len(feature_columns))
+            mlp_explainer = shap.GradientExplainer(mlp_model, background)
+            mlp_shap_all  = mlp_explainer.shap_values(torch.from_numpy(X_clean))
+            print(f"MLP SHAP done — {len(mlp_shap_all)} classes")
+            # mlp_shap_all: list of n_classes arrays, each (1, n_features)
+
+            # Only compute for features the user actually inputted
+            inputted_mask    = X_clean[0] != 0
+            inputted_indices = np.where(inputted_mask)[0]
+
+            for c in range(num_classes_local):
+                cancer_name = label_encoder.classes_[c]
+
+                # XGB SHAP for this class
+                if xgb_shap_raw.ndim == 3:
+                    if xgb_shap_raw.shape[1] == num_classes_local:
+                        xgb_shap_c = xgb_shap_raw[0, c, :-1]
+                    else:
+                        xgb_shap_c = xgb_shap_raw[0, :-1, c]
+                else:
+                    n_feat_plus1 = xgb_shap_raw.shape[1] // num_classes_local
+                    reshaped     = xgb_shap_raw[0].reshape(num_classes_local, n_feat_plus1)
+                    xgb_shap_c   = reshaped[c, :-1]
+
+                mlp_shap_c    = np.array(mlp_shap_all[c][0])
+                ensemble_shap = 0.6 * xgb_shap_c + 0.4 * mlp_shap_c
+
+                if len(inputted_indices) == 0:
+                    shap_by_class[cancer_name] = []
+                    continue
+
+                inputted_shap = ensemble_shap[inputted_indices]
+                top_indices   = np.argsort(np.abs(inputted_shap))[::-1]
+                shap_features_list = []
+                for i in top_indices:
+                    fname = feature_columns[inputted_indices[i]]
+                    if fname == "IS_MUTATED":
+                        continue
+                    shap_features_list.append({
+                        "feature":    fname,
+                        "shap_value": float(inputted_shap[i])
+                    })
+                shap_by_class[cancer_name] = shap_features_list
+
+            print(f"SHAP computed for all {num_classes_local} classes")
+
+        except Exception as shap_error:
+            print(f"SHAP computation failed: {shap_error}")
+            import traceback
+            traceback.print_exc()
+            shap_by_class = {}
+        flush()
+
+        return jsonify({
+            "status": "success",
+            "predictions": results,
+            "shap_by_class": shap_by_class
+        })
 
     except Exception as e:
         print(f"Error in prediction: {str(e)}")
@@ -641,7 +679,6 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("OmniCUP + CIVIC Therapy Lookup Server")
     print("=" * 60)
-    print("Model files present:")
     print(f"ensemble_info.pkl: {os.path.exists('ensemble_info.pkl')}")
     print(f"label_encoder.pkl: {os.path.exists('label_encoder.pkl')}")
     print(f"xgb_model.json: {os.path.exists('xgb_model.json')}")
