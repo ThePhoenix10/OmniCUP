@@ -578,17 +578,6 @@ input[type="checkbox"] {
     visibility: visible;
     opacity: 1;
 }
-#therapy-tab h2 {
-    color: var(--accent-blue);
-    margin-bottom: 32px;
-    font-size: 18px;
-    text-transform: none;
-    letter-spacing: normal;
-    font-weight: 700;
-}
-
-#therapy-tab h2::after { display: none; }
-
 #therapy-tab .form-row {
     display: flex;
     flex-direction: column;
