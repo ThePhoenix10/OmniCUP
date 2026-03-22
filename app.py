@@ -412,10 +412,7 @@ Be specific. Keep it concise. Do NOT mention therapy combinations."""
                 all_results_text += f"--------------------------------------------------\n{gene}\n--------------------------------------------------\nNo results found or query error.\n\n"
                 all_summaries += f"SUMMARY: {gene}\n[No therapies found]\n\n"
 
-        final_output = f"""--------------------------------------------------
-SUMMARIES (2 SENTENCES PER GENE)
---------------------------------------------------
-{all_summaries}
+        final_output = f"""{all_summaries}
 
 --------------------------------------------------
 THERAPIES FROM CIVIC DATABASE (BY GENE)
@@ -568,7 +565,6 @@ def predict():
         print("=" * 60 + "\n")
         flush()
 
-        # Replace NaN before model inference
         X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         dmatrix = xgb.DMatrix(X_clean, nthread=1)
@@ -599,7 +595,6 @@ def predict():
 
         shap_by_class = {}
         try:
-            # XGBoost native SHAP — (1, n_classes, n_features+1)
             xgb_shap_raw = xgb_model.predict(
                 xgb.DMatrix(X_clean, nthread=1),
                 pred_contribs=True
@@ -608,21 +603,17 @@ def predict():
 
             num_classes_local = len(label_encoder.classes_)
 
-            # MLP SHAP for all classes at once
-            background   = torch.zeros(1, len(feature_columns))
+            background = torch.zeros(1, len(feature_columns))
             mlp_explainer = shap.GradientExplainer(mlp_model, background)
-            mlp_shap_all  = mlp_explainer.shap_values(torch.from_numpy(X_clean))
+            mlp_shap_all = mlp_explainer.shap_values(torch.from_numpy(X_clean))
             print(f"MLP SHAP done — {len(mlp_shap_all)} classes")
-            # mlp_shap_all: list of n_classes arrays, each (1, n_features)
 
-            # Only compute for features the user actually inputted
-            inputted_mask    = X_clean[0] != 0
+            inputted_mask = X_clean[0] != 0
             inputted_indices = np.where(inputted_mask)[0]
 
             for c in range(num_classes_local):
                 cancer_name = label_encoder.classes_[c]
 
-                # XGB SHAP for this class
                 if xgb_shap_raw.ndim == 3:
                     if xgb_shap_raw.shape[1] == num_classes_local:
                         xgb_shap_c = xgb_shap_raw[0, c, :-1]
@@ -630,10 +621,10 @@ def predict():
                         xgb_shap_c = xgb_shap_raw[0, :-1, c]
                 else:
                     n_feat_plus1 = xgb_shap_raw.shape[1] // num_classes_local
-                    reshaped     = xgb_shap_raw[0].reshape(num_classes_local, n_feat_plus1)
-                    xgb_shap_c   = reshaped[c, :-1]
+                    reshaped = xgb_shap_raw[0].reshape(num_classes_local, n_feat_plus1)
+                    xgb_shap_c = reshaped[c, :-1]
 
-                mlp_shap_c    = np.array(mlp_shap_all[c][0])
+                mlp_shap_c = np.array(mlp_shap_all[c][0])
                 ensemble_shap = 0.6 * xgb_shap_c + 0.4 * mlp_shap_c
 
                 if len(inputted_indices) == 0:
@@ -641,14 +632,14 @@ def predict():
                     continue
 
                 inputted_shap = ensemble_shap[inputted_indices]
-                top_indices   = np.argsort(np.abs(inputted_shap))[::-1]
+                top_indices = np.argsort(np.abs(inputted_shap))[::-1]
                 shap_features_list = []
                 for i in top_indices:
                     fname = feature_columns[inputted_indices[i]]
                     if fname == "IS_MUTATED":
                         continue
                     shap_features_list.append({
-                        "feature":    fname,
+                        "feature": fname,
                         "shap_value": float(inputted_shap[i])
                     })
                 shap_by_class[cancer_name] = shap_features_list
