@@ -15,7 +15,7 @@
     --error: #dc2626;
     --border: #e8eaed;
     --text-primary: #0f1318;
-    --text-secondary: #6b7280;
+    --text-secondary: #111827;
     --bg-page: #f0f2f7;
     --bg-subtle: #f7f8fa;
     --bg-card: #ffffff;
@@ -101,6 +101,7 @@ body {
     display: none;
     animation: fadeIn 0.25s ease;
     padding: 36px 52px 52px;
+    background: #eef1f8;
 }
 
 .tab-content.active {
@@ -169,7 +170,7 @@ input:focus, select:focus {
     box-shadow: 0 0 0 3px rgba(59,111,212,0.12);
 }
 
-input::placeholder { color: #b0b7c3; }
+input::placeholder { color: #374151; }
 .autocomplete-wrapper {
     position: relative;
     margin-bottom: 20px;
@@ -380,10 +381,7 @@ input[type="checkbox"] {
     user-select: none;
 }
 .empty-state {
-    color: #b0b7c3;
-    font-size: 13px;
-    padding: 16px;
-    text-align: center;
+    color: #374151;
 }
 .status-message {
     padding: 12px 16px;
@@ -599,7 +597,7 @@ input[type="checkbox"] {
 #therapy-tab label {
     font-size: 14px;
     font-weight: 600;
-    color: var(--text-primary);
+    color: #0f1318;
     text-transform: none;
     letter-spacing: normal;
     margin-bottom: 10px;
@@ -615,7 +613,7 @@ input[type="checkbox"] {
 }
 
 #therapy-tab input::placeholder {
-    color: #b0b7c3;
+    color: #374151;
     font-style: italic;
 }
 @media (max-width: 1280px) {
