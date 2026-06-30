@@ -9,7 +9,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-from openai import OpenAI
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import numpy as np
@@ -19,12 +18,26 @@ import torch.nn as nn
 import xgboost as xgb
 import pandas as pd
 import shap
-from llama_index.experimental.query_engine import PandasQueryEngine
-
-llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
+
+# ==============================================================================
+# ENSEMBLE LAYOUT
+# ==============================================================================
+# Models produced by the training pipeline live in these folders, next to app.py:
+#   xgb_models/xgb_model_0.json ... xgb_model_9.json
+#   mlp_models/mlp_model_0.pt   ... mlp_model_9.pt
+# Blend weights (xgb_weight / mlp_weight) and per-MLP architectures come from
+# ensemble_info.pkl, so nothing here is hardcoded to a fixed blend or arch.
+XGB_DIR = "xgb_models"
+MLP_DIR = "mlp_models"
+
+# SHAP across every member is the most faithful but also the slowest part of a
+# request (one GradientExplainer per MLP). Set this to an int (e.g. 3) to use
+# only the first N members per family for SHAP; None = use all members.
+SHAP_MEMBER_LIMIT = None
+
 
 @app.route("/")
 def index():
@@ -45,47 +58,6 @@ except Exception as e:
     print(f"Could not list directory: {e}")
 flush()
 
-print("Loading CIVIC database")
-CIVIC_DF = None
-query_engine = None
-
-try:
-    if os.path.exists("Civic.xlsx"):
-        CIVIC_DF = pd.read_excel("Civic.xlsx")
-        print(f"CIVIC database loaded from Excel with {len(CIVIC_DF)} rows")
-    elif os.path.exists("Civic.csv"):
-        CIVIC_DF = pd.read_csv("Civic.csv")
-        print(f"CIVIC database loaded from CSV with {len(CIVIC_DF)} rows")
-    else:
-        print("CIVIC database file not found (Civic.xlsx or Civic.csv)")
-
-    if CIVIC_DF is not None:
-        print(f"Columns: {CIVIC_DF.columns.tolist()}")
-
-        query_engine = PandasQueryEngine(
-            df=CIVIC_DF,
-            verbose=False,
-            synthesize_response=False,
-            instruction_str=f"""
-You are working with a pandas dataframe named df. These are the EXACT column names:
-{CIVIC_DF.columns.tolist()}
-
-Rules:
-- Use ONLY these column names.
-- Do NOT invent or rename columns.
-- Use exact string matching.
-- Return valid pandas expressions only.
-- Be precise and factual in your analysis.
-- Display ALL rows without any truncation or ellipsis.
-"""
-        )
-        print("PandasQueryEngine initialized successfully")
-except Exception as e:
-    print(f"Error loading CIVIC database: {e}")
-    CIVIC_DF = None
-    query_engine = None
-flush()
-
 def load_hotspots_from_csv(filepath):
     try:
         df = pd.read_csv(filepath)
@@ -104,13 +76,24 @@ def load_genes_from_ensemble_info(filepath):
     try:
         ensemble_info_local = joblib.load(filepath)
         feature_cols = ensemble_info_local.get("feature_columns", [])
-        genomic_suffixes = ["_NON_LOF", "_LOF", "_MUT", "_AMP", "_DEL", "_FUSION"]
+        # Gene-level suffixes in the new (LOF/Non-LOF-free) schema. Longest first
+        # so e.g. "_Frame_Shift_Del" is matched before any shorter overlap. The
+        # "." guard skips allele-level keys like "TP53.R175H_AA_HOTSPOT", which
+        # belong to the separate hotspot picker, not the gene list.
+        genomic_suffixes = [
+            "_ANY_SOM_MAT",
+            "_Missense_Mutation", "_Nonsense_Mutation",
+            "_Frame_Shift_Ins", "_Frame_Shift_Del",
+            "_Translation_Start_Site", "_Splice_Site",
+            "_In_Frame_Ins", "_In_Frame_Del", "_Nonstop_Mutation",
+            "_ANY_CNA", "_AMP", "_DEL", "_FUSION", "_HOTSPOT",
+        ]
         genes = set()
         for col in feature_cols:
             for suffix in genomic_suffixes:
                 if col.endswith(suffix):
                     gene = col[:-len(suffix)]
-                    if gene:
+                    if gene and "." not in gene:
                         genes.add(gene)
                     break
         genes = sorted(list(genes))
@@ -126,11 +109,32 @@ feature_columns = []
 label_encoder = None
 FEATURE_SET = set()
 
+# Blend weights + member counts come straight from ensemble_info.pkl.
+XGB_WEIGHT = 0.5
+MLP_WEIGHT = 0.5
+N_XGB = 10
+N_MLP = 10
+
 try:
     ensemble_info = joblib.load("ensemble_info.pkl")
     feature_columns = ensemble_info.get("feature_columns", [])
     FEATURE_SET = set(feature_columns)
+
+    # Grid-search-selected blend (with backward-compatible aliases).
+    XGB_WEIGHT = float(
+        ensemble_info.get("xgb_weight",
+                          ensemble_info.get("best_weight_xgb", 0.5))
+    )
+    MLP_WEIGHT = float(
+        ensemble_info.get("mlp_weight",
+                          ensemble_info.get("best_weight_mlp", 1.0 - XGB_WEIGHT))
+    )
+    N_XGB = int(ensemble_info.get("n_xgb", 10))
+    N_MLP = int(ensemble_info.get("n_mlp", 10))
+
     print(f"Loaded ensemble_info.pkl with {len(feature_columns)} features")
+    print(f"Blend weights -> XGB: {XGB_WEIGHT:.2f} | MLP: {MLP_WEIGHT:.2f}")
+    print(f"Member counts -> XGB: {N_XGB} | MLP: {N_MLP}")
 except Exception as e:
     print(f"ensemble_info.pkl not loaded: {e}")
 
@@ -141,67 +145,98 @@ except Exception as e:
     print(f"label_encoder.pkl not loaded: {e}")
 flush()
 
-print("Loading XGBoost booster")
-xgb_model = None
+# ==============================================================================
+# LOAD 10 XGBOOST BOOSTERS
+# ==============================================================================
+print(f"Loading {N_XGB} XGBoost boosters from '{XGB_DIR}/'")
+xgb_models = []
 try:
-    xgb_model = xgb.Booster({"nthread": 1})
-    xgb_model.load_model("xgb_model.json")
-    print("XGBoost loaded successfully")
+    for i in range(N_XGB):
+        path = os.path.join(XGB_DIR, f"xgb_model_{i}.json")
+        if not os.path.exists(path):
+            print(f"  ! Missing {path} -- skipping")
+            continue
+        booster = xgb.Booster({"nthread": 1})
+        booster.load_model(path)
+        xgb_models.append(booster)
+    print(f"XGBoost ensemble loaded: {len(xgb_models)} / {N_XGB} members")
 except Exception as e:
-    print(f"XGBoost model not loaded: {e}")
-    xgb_model = None
+    print(f"XGBoost ensemble not loaded: {e}")
+    xgb_models = []
 flush()
 
-class MLP(nn.Module):
-    def __init__(self, d, c):
+# ==============================================================================
+# DYNAMIC MLP (matches the training pipeline; arch travels with each checkpoint)
+# ==============================================================================
+class DynamicMLP(nn.Module):
+    def __init__(self, d_in, h1, h2, c_out, p_drop):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(d, 903),
-            nn.BatchNorm1d(903),
+            nn.Linear(d_in, h1),
+            nn.BatchNorm1d(h1),
             nn.ReLU(),
-            nn.Dropout(0.2637),
-            nn.Linear(903, 1806),
-            nn.BatchNorm1d(1806),
+            nn.Dropout(p_drop),
+
+            nn.Linear(h1, h2),
+            nn.BatchNorm1d(h2),
             nn.ReLU(),
-            nn.Dropout(0.2637),
-            nn.Linear(1806, c)
+            nn.Dropout(p_drop),
+
+            nn.Linear(h2, c_out)
         )
 
     def forward(self, x):
         return self.net(x)
 
-print("Loading MLP checkpoint")
-mlp_model = None
+# ==============================================================================
+# LOAD 10 MLP MODELS (each rebuilt from its own saved architecture)
+# ==============================================================================
+print(f"Loading {N_MLP} MLP checkpoints from '{MLP_DIR}/'")
+mlp_models = []
 try:
-    checkpoint = torch.load("mlp_model.pt", map_location="cpu")
-    mlp_model = MLP(
-        d=checkpoint["input_dim"],
-        c=checkpoint["num_classes"]
-    )
-    mlp_model.load_state_dict(checkpoint["model_state_dict"])
-    mlp_model.eval()
-    print("MLP loaded successfully")
+    for i in range(N_MLP):
+        path = os.path.join(MLP_DIR, f"mlp_model_{i}.pt")
+        if not os.path.exists(path):
+            print(f"  ! Missing {path} -- skipping")
+            continue
+        ckpt = torch.load(path, map_location="cpu")
+        net = DynamicMLP(
+            d_in=ckpt["input_dim"],
+            h1=ckpt["h1"],
+            h2=ckpt["h2"],
+            c_out=ckpt["num_classes"],
+            p_drop=ckpt["p_drop"],
+        )
+        net.load_state_dict(ckpt["model_state_dict"])
+        net.eval()
+        mlp_models.append(net)
+    print(f"MLP ensemble loaded: {len(mlp_models)} / {N_MLP} members")
 except Exception as e:
-    print(f"MLP model not loaded: {e}")
-    mlp_model = None
+    print(f"MLP ensemble not loaded: {e}")
+    import traceback
+    traceback.print_exc()
+    mlp_models = []
 flush()
+
 
 @app.route("/api/model-status", methods=["GET"])
 def model_status():
     status = {
-        "xgb_loaded": xgb_model is not None,
-        "mlp_loaded": mlp_model is not None,
+        "xgb_loaded": len(xgb_models) > 0,
+        "mlp_loaded": len(mlp_models) > 0,
+        "xgb_members": len(xgb_models),
+        "mlp_members": len(mlp_models),
+        "xgb_weight": XGB_WEIGHT,
+        "mlp_weight": MLP_WEIGHT,
         "label_encoder_loaded": label_encoder is not None,
         "feature_columns_count": len(feature_columns) if feature_columns is not None else 0,
         "cwd": os.getcwd(),
         "files_present": {
             "ensemble_info.pkl": os.path.exists("ensemble_info.pkl"),
             "label_encoder.pkl": os.path.exists("label_encoder.pkl"),
-            "xgb_model.json": os.path.exists("xgb_model.json"),
-            "mlp_model.pt": os.path.exists("mlp_model.pt"),
+            "xgb_models/": os.path.isdir(XGB_DIR),
+            "mlp_models/": os.path.isdir(MLP_DIR),
             "Allele_Level_Hotspot_Feature_Names.csv": os.path.exists("Allele_Level_Hotspot_Feature_Names.csv"),
-            "Civic.xlsx": os.path.exists("Civic.xlsx"),
-            "Civic.csv": os.path.exists("Civic.csv"),
         }
     }
     return jsonify(status)
@@ -215,8 +250,8 @@ def get_data():
         "genes": genes,
         "hotspots": hotspots,
         "ensemble_weights": {
-            "xgboost": 0.6,
-            "mlp": 0.4
+            "xgboost": XGB_WEIGHT,
+            "mlp": MLP_WEIGHT
         }
     })
 
@@ -272,177 +307,128 @@ def debug_patient():
     flush()
     return jsonify({"status": "logged"})
 
-def parse_comma_delimited_genes(gene_input):
-    if not gene_input:
-        return []
-    genes = [g.strip() for g in gene_input.split(",")]
-    genes = [g for g in genes if g]
-    return genes
+def build_feature_vector(data):
+    """Turn the UI payload into the model feature vector (shared by predict)."""
+    features = {}
+    genes_with_mut = set()
+    genes_with_hotspot = set()
 
-@app.route("/api/therapy-lookup", methods=["POST"])
-def therapy_lookup():
-    try:
-        if CIVIC_DF is None or query_engine is None:
-            return jsonify({
-                "status": "error",
-                "message": "CIVIC database not loaded. Ensure Civic.xlsx or Civic.csv is in the application directory."
-            }), 500
+    c = data.get("Clinical", {})
 
-        data = request.json
+    if c.get("Age") is not None and c.get("Age") != "":
+        try:
+            age_val = float(c["Age"])
+            features["AGE_AT_SEQUENCING"] = age_val if not np.isnan(age_val) else np.nan
+        except (ValueError, TypeError):
+            features["AGE_AT_SEQUENCING"] = np.nan
+    else:
+        features["AGE_AT_SEQUENCING"] = np.nan
 
-        print("\n" + "=" * 60)
-        print("Therapy Lookup Debug Request")
-        print("=" * 60)
-        print(f"Raw request data: {data}")
-        print("=" * 60 + "\n")
-        flush()
+    if c.get("Sex") is not None and c.get("Sex") != "":
+        features["SEX"] = 1 if c["Sex"] == "Male" else 0
+    else:
+        features["SEX"] = np.nan
 
-        cancer_type = data.get("cancer_type", "").strip() if isinstance(data.get("cancer_type"), str) else ""
-        if not cancer_type:
-            cancer_type = data.get("predicted_cancer_type", "").strip() if isinstance(data.get("predicted_cancer_type"), str) else ""
+    if c.get("TMB") is not None and c.get("TMB") != "":
+        try:
+            tmb_val = float(c["TMB"])
+            features["TMB_NONSYNONYMOUS"] = tmb_val if not np.isnan(tmb_val) else np.nan
+        except (ValueError, TypeError):
+            features["TMB_NONSYNONYMOUS"] = np.nan
+    else:
+        features["TMB_NONSYNONYMOUS"] = np.nan
 
-        gene_input = data.get("gene", "").strip() if isinstance(data.get("gene"), str) else ""
-        molecular_alterations = parse_comma_delimited_genes(gene_input)
+    if c.get("MSI") is not None and c.get("MSI") != "":
+        try:
+            msi_val = float(c["MSI"])
+            features["MSI_SCORE"] = msi_val if not np.isnan(msi_val) else np.nan
+        except (ValueError, TypeError):
+            features["MSI_SCORE"] = np.nan
+    else:
+        features["MSI_SCORE"] = np.nan
 
-        print(f"Parsed cancer_type: {cancer_type}")
-        print(f"Parsed molecular_alterations: {molecular_alterations}\n")
-        flush()
+    for k, v in data.get("DMETS", {}).items():
+        if v and k in FEATURE_SET:
+            features[k] = 1
 
-        if not cancer_type:
-            return jsonify({
-                "status": "error",
-                "message": "Please provide cancer_type or predicted_cancer_type."
-            }), 400
+    # The nine somatic-mutation subcategories (plus the ANY rollup) that, when
+    # present, imply the gene-level _ANY_SOM_MAT flag and the global
+    # IS_ANY_SOM_MAT flag -- exactly how the curation script derives them.
+    MUT_SUBCATS = {
+        "ANY_SOM_MAT",
+        "Missense_Mutation", "Nonsense_Mutation",
+        "Frame_Shift_Ins", "Frame_Shift_Del",
+        "Splice_Site", "Translation_Start_Site",
+        "In_Frame_Ins", "In_Frame_Del", "Nonstop_Mutation",
+    }
 
-        if not molecular_alterations:
-            return jsonify({
-                "status": "error",
-                "message": "Please provide at least one molecular alteration (comma-delimited)."
-            }), 400
+    genes_with_cna = set()
 
-        print("Querying CIVIC database for each gene and generating summaries\n")
-        flush()
+    for gene, alts in data.get("Genes", {}).items():
+        gene = gene.strip()
+        for alt, active in alts.items():
+            if not active:
+                continue
+            col = f"{gene}_{alt}"
+            if col in FEATURE_SET:
+                features[col] = 1
+            if alt in MUT_SUBCATS:
+                genes_with_mut.add(gene)
+            elif alt in ("AMP", "DEL"):
+                genes_with_cna.add(gene)
 
-        all_summaries = ""
-        all_results_text = ""
+    for label in data.get("Hotspots", []):
+        if " - " not in label:
+            continue
+        base, kind = label.split(" - ", 1)
+        gene = base.split(".")[0]
+        if kind.lower().startswith("amino"):
+            col = f"{base}_AA_HOTSPOT"
+        elif kind.lower().startswith("splice"):
+            col = f"{base}_splice_SPLICE_HOTSPOT"
+        else:
+            continue
+        if col in FEATURE_SET:
+            features[col] = 1
+        genes_with_hotspot.add(gene)
+        genes_with_mut.add(gene)   # a hotspot is a somatic mutation
 
-        for gene in molecular_alterations:
-            print(f"\nProcessing: {gene} + {cancer_type}")
-            flush()
+    # --- Roll-ups so the vector matches the training data distribution ---
+    # A specific mutation subcategory never appears in training without its
+    # gene-level _ANY_SOM_MAT and the global IS_ANY_SOM_MAT also being set.
+    if genes_with_mut and "IS_ANY_SOM_MAT" in FEATURE_SET:
+        features["IS_ANY_SOM_MAT"] = 1
+    for g in genes_with_mut:
+        col = f"{g}_ANY_SOM_MAT"
+        if col in FEATURE_SET:
+            features[col] = 1
+    # AMP or DEL implies the gene-level _ANY_CNA flag.
+    for g in genes_with_cna:
+        col = f"{g}_ANY_CNA"
+        if col in FEATURE_SET:
+            features[col] = 1
+    for g in genes_with_hotspot:
+        col = f"{g}_HOTSPOT"
+        if col in FEATURE_SET:
+            features[col] = 1
 
-            query = f"""
-A patient has the following molecular alteration:
-{gene}
+    X = np.zeros((1, len(feature_columns)), dtype=np.float32)
+    col_idx = {cc: i for i, cc in enumerate(feature_columns)}
+    for k, v in features.items():
+        if k in col_idx:
+            X[0, col_idx[k]] = v
 
-The cancer type is:
-{cancer_type}
+    return X, features
 
-Using ONLY the dataframe provided:
-
-1. Identify rows where:
-   - molecular_profile exactly matches '{gene}'
-   - AND disease exactly matches '{cancer_type}'
-
-2. Return ALL matching rows (do NOT merge, group, or deduplicate).
-
-3. Display EVERY row with NO truncation or ellipsis (...).
-
-4. For EACH returned row, output these columns:
-   - therapies
-   - evidence_level
-   - rating
-   - citation
-
-5. Do NOT hide any rows. Show all matching rows completely.
-6. Set pandas display options to show all rows: pd.set_option('display.max_rows', None) and pd.set_option('display.max_colwidth', None)
-"""
-
-            print("Query sent to PandasQueryEngine")
-            flush()
-
-            try:
-                response = query_engine.query(query)
-                raw_response_text = str(response)
-
-                print(f"Query successful for {gene}")
-                print(f"Response:\n{raw_response_text}\n")
-                flush()
-
-                all_results_text += f"--------------------------------------------------\n{gene}\n--------------------------------------------------\n{raw_response_text}\n\n"
-
-                llm_summary_prompt = f"""You are an expert oncologist. Based on these CIVIC database results, provide a brief 2-sentence summary ONLY.
-
-GENE: {gene}
-CANCER TYPE: {cancer_type}
-
-DATABASE RESULTS:
-{raw_response_text}
-
-Provide ONLY 2 sentences:
-1. What is the most prevalent SINGLE therapy (not combinations) and what evidence level backs it up?
-2. How strong is this evidence based on the clinical rating and outcomes?
-
-Be specific. Keep it concise. Do NOT mention therapy combinations."""
-
-                try:
-                    print(f"Generating summary for {gene}")
-                    flush()
-
-                    llm_response = llm.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {"role": "user", "content": llm_summary_prompt}
-                        ],
-                        temperature=0
-                    )
-                    gene_summary = llm_response.choices[0].message.content
-                    print(f"Summary generated for {gene}")
-                    flush()
-
-                    all_summaries += f"SUMMARY: {gene}\n{gene_summary}\n"
-
-                except Exception as llm_error:
-                    print(f"Could not generate summary for {gene}: {str(llm_error)}")
-                    flush()
-                    all_summaries += f"SUMMARY: {gene}\n[Summary generation failed]\n\n"
-
-            except Exception as query_error:
-                print(f"Query failed for {gene}: {str(query_error)}")
-                flush()
-                all_results_text += f"--------------------------------------------------\n{gene}\n--------------------------------------------------\nNo results found or query error.\n\n"
-                all_summaries += f"SUMMARY: {gene}\n[No therapies found]\n\n"
-
-        final_output = f"""{all_summaries}
-
---------------------------------------------------
-THERAPIES FROM CIVIC DATABASE (BY GENE)
---------------------------------------------------
-{all_results_text}
-"""
-
-        return jsonify({
-            "status": "success",
-            "clinical_analysis": final_output
-        })
-
-    except Exception as e:
-        print(f"Error in therapy lookup: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        flush()
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
 
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
         missing = []
-        if xgb_model is None:
-            missing.append("xgb_model.json")
-        if mlp_model is None:
-            missing.append("mlp_model.pt")
+        if len(xgb_models) == 0:
+            missing.append("xgb_models/ (no boosters loaded)")
+        if len(mlp_models) == 0:
+            missing.append("mlp_models/ (no MLPs loaded)")
         if label_encoder is None:
             missing.append("label_encoder.pkl")
         if feature_columns is None or len(feature_columns) == 0:
@@ -458,103 +444,21 @@ def predict():
             }), 500
 
         data = request.json
-        features = {}
-        any_mutation = False
-        genes_with_mut = set()
-        genes_with_hotspot = set()
-
-        c = data.get("Clinical", {})
-
-        if c.get("Age") is not None and c.get("Age") != "":
-            try:
-                age_val = float(c["Age"])
-                features["AGE_AT_SEQUENCING"] = age_val if not np.isnan(age_val) else np.nan
-            except (ValueError, TypeError):
-                features["AGE_AT_SEQUENCING"] = np.nan
-        else:
-            features["AGE_AT_SEQUENCING"] = np.nan
-
-        if c.get("Sex") is not None and c.get("Sex") != "":
-            features["SEX"] = 1 if c["Sex"] == "Male" else 0
-        else:
-            features["SEX"] = np.nan
-
-        if c.get("TMB") is not None and c.get("TMB") != "":
-            try:
-                tmb_val = float(c["TMB"])
-                features["TMB_NONSYNONYMOUS"] = tmb_val if not np.isnan(tmb_val) else np.nan
-            except (ValueError, TypeError):
-                features["TMB_NONSYNONYMOUS"] = np.nan
-        else:
-            features["TMB_NONSYNONYMOUS"] = np.nan
-
-        if c.get("MSI") is not None and c.get("MSI") != "":
-            try:
-                msi_val = float(c["MSI"])
-                features["MSI_SCORE"] = msi_val if not np.isnan(msi_val) else np.nan
-            except (ValueError, TypeError):
-                features["MSI_SCORE"] = np.nan
-        else:
-            features["MSI_SCORE"] = np.nan
-
-        for k, v in data.get("DMETS", {}).items():
-            if v and k in FEATURE_SET:
-                features[k] = 1
-
-        for gene, alts in data.get("Genes", {}).items():
-            gene = gene.strip()
-            for alt, active in alts.items():
-                if not active:
-                    continue
-                col = f"{gene}_{alt}"
-                if col in FEATURE_SET:
-                    features[col] = 1
-                if alt in ["LOF", "NON_LOF"]:
-                    genes_with_mut.add(gene)
-                any_mutation = True
-
-        for label in data.get("Hotspots", []):
-            if " - " not in label:
-                continue
-            base, kind = label.split(" - ", 1)
-            gene = base.split(".")[0]
-            if kind.lower().startswith("amino"):
-                col = f"{base}_AA_HOTSPOT"
-            elif kind.lower().startswith("splice"):
-                col = f"{base}_splice_SPLICE_HOTSPOT"
-            else:
-                continue
-            if col in FEATURE_SET:
-                features[col] = 1
-            genes_with_hotspot.add(gene)
-            genes_with_mut.add(gene)
-            any_mutation = True
-
-        if any_mutation and "IS_MUTATED" in FEATURE_SET:
-            features["IS_MUTATED"] = 1
-        for g in genes_with_mut:
-            col = f"{g}_MUT"
-            if col in FEATURE_SET:
-                features[col] = 1
-        for g in genes_with_hotspot:
-            col = f"{g}_HOTSPOT"
-            if col in FEATURE_SET:
-                features[col] = 1
-
-        X = np.zeros((1, len(feature_columns)), dtype=np.float32)
-        col_idx = {cc: i for i, cc in enumerate(feature_columns)}
-        for k, v in features.items():
-            if k in col_idx:
-                X[0, col_idx[k]] = v
+        X, features = build_feature_vector(data)
 
         print("\n" + "=" * 60)
         print("SANITY CHECK: ALL FEATURES PASSED")
         print("=" * 60)
-        print(f"AGE_AT_SEQUENCING: {features.get('AGE_AT_SEQUENCING')}")
-        print(f"SEX: {features.get('SEX')}")
-        print(f"TMB_NONSYNONYMOUS: {features.get('TMB_NONSYNONYMOUS')}")
-        print(f"MSI_SCORE: {features.get('MSI_SCORE')}")
-        genes_added = [k for k in features if any(s in k for s in ['_LOF','_NON_LOF','_AMP','_DEL','_FUSION','_MUT','_HOTSPOT'])]
+        def _fv(name):
+            v = features.get(name)
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return "N/A (no value -> treated as missing)"
+            return v
+        print(f"AGE_AT_SEQUENCING: {_fv('AGE_AT_SEQUENCING')}")
+        print(f"SEX: {_fv('SEX')}")
+        print(f"TMB_NONSYNONYMOUS: {_fv('TMB_NONSYNONYMOUS')}")
+        print(f"MSI_SCORE: {_fv('MSI_SCORE')}")
+        genes_added = [k for k in features if any(s in k for s in ['_Mutation', '_Frame_Shift_', '_Splice_Site', '_Translation_Start_Site', '_In_Frame_', '_Nonstop_', '_ANY_SOM_MAT', '_AMP', '_DEL', '_ANY_CNA', '_FUSION', '_HOTSPOT'])]
         if genes_added:
             for gf in sorted(genes_added):
                 print(f"{gf}: {features[gf]}")
@@ -562,19 +466,44 @@ def predict():
         if dmets_added:
             for df in sorted(dmets_added):
                 print(f"{df}: {features[df]}")
+        print(f"Blend -> XGB {XGB_WEIGHT:.2f} ({len(xgb_models)} members) / "
+              f"MLP {MLP_WEIGHT:.2f} ({len(mlp_models)} members)")
         print("=" * 60 + "\n")
         flush()
 
-        X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        # Two views of the same patient vector:
+        #   X_xgb -> blank clinical fields stay NaN; XGBoost reads NaN as "missing"
+        #            and routes it down each split's default branch. Absent genes
+        #            and DMETS are a genuine 0 (not missing), so they remain 0.
+        #   X_mlp -> NaN replaced with 0, because a dense net cannot ingest NaN
+        #            (it would propagate to NaN logits). Only the blank clinical
+        #            fields differ between the two views; genomic 0s are identical.
+        # ±inf (shouldn't occur) -> missing for XGB, 0 for MLP.
+        X_xgb = np.where(np.isinf(X), np.nan, X).astype(np.float32)
+        X_mlp = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
-        dmatrix = xgb.DMatrix(X_clean, nthread=1)
-        xgb_proba = xgb_model.predict(dmatrix)
+        # ----------------------------------------------------------------------
+        # XGBoost: mean soft-vote over all boosters (best iteration baked into JSON)
+        # ----------------------------------------------------------------------
+        dmatrix = xgb.DMatrix(X_xgb, nthread=1, missing=np.nan)
+        xgb_probs = np.stack([booster.predict(dmatrix) for booster in xgb_models], axis=0)
+        mean_xgb_proba = xgb_probs.mean(axis=0)
 
+        # ----------------------------------------------------------------------
+        # MLP: mean soft-vote over all neural nets
+        # ----------------------------------------------------------------------
+        mlp_probs = []
         with torch.no_grad():
-            logits = mlp_model(torch.from_numpy(X_clean))
-            mlp_proba = torch.softmax(logits, 1).numpy()
+            x_tensor = torch.from_numpy(X_mlp)
+            for net in mlp_models:
+                logits = net(x_tensor)
+                mlp_probs.append(torch.softmax(logits, 1).numpy())
+        mean_mlp_proba = np.stack(mlp_probs, axis=0).mean(axis=0)
 
-        ensemble = 0.6 * xgb_proba + 0.4 * mlp_proba
+        # ----------------------------------------------------------------------
+        # Weighted blend (weights selected on validation, from ensemble_info.pkl)
+        # ----------------------------------------------------------------------
+        ensemble = XGB_WEIGHT * mean_xgb_proba + MLP_WEIGHT * mean_mlp_proba
         row_sums = ensemble.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0
         ensemble = ensemble / row_sums
@@ -593,22 +522,47 @@ def predict():
                 "confidence": f"{prob * 100:.1f}%"
             })
 
+        # ----------------------------------------------------------------------
+        # SHAP: average contributions across the ensemble, then blend
+        # ----------------------------------------------------------------------
         shap_by_class = {}
         try:
-            xgb_shap_raw = xgb_model.predict(
-                xgb.DMatrix(X_clean, nthread=1),
-                pred_contribs=True
-            )
-            print(f"XGBoost SHAP raw shape: {xgb_shap_raw.shape}")
-
             num_classes_local = len(label_encoder.classes_)
 
-            background = torch.zeros(1, len(feature_columns))
-            mlp_explainer = shap.GradientExplainer(mlp_model, background)
-            mlp_shap_all = mlp_explainer.shap_values(torch.from_numpy(X_clean))
-            print(f"MLP SHAP done — {len(mlp_shap_all)} classes")
+            xgb_for_shap = xgb_models if SHAP_MEMBER_LIMIT is None else xgb_models[:SHAP_MEMBER_LIMIT]
+            mlp_for_shap = mlp_models if SHAP_MEMBER_LIMIT is None else mlp_models[:SHAP_MEMBER_LIMIT]
 
-            inputted_mask = X_clean[0] != 0
+            # --- XGB SHAP: mean of pred_contribs over boosters ---
+            xgb_shap_stack = []
+            for booster in xgb_for_shap:
+                contrib = booster.predict(
+                    xgb.DMatrix(X_xgb, nthread=1, missing=np.nan),
+                    pred_contribs=True
+                )
+                xgb_shap_stack.append(contrib)
+            xgb_shap_raw = np.mean(xgb_shap_stack, axis=0)
+            print(f"XGBoost SHAP raw shape: {xgb_shap_raw.shape} "
+                  f"(avg over {len(xgb_for_shap)} boosters)")
+
+            # --- MLP SHAP: mean of GradientExplainer values over nets ---
+            background = torch.zeros(1, len(feature_columns))
+            mlp_shap_accum = None
+            for net in mlp_for_shap:
+                explainer = shap.GradientExplainer(net, background)
+                sv = explainer.shap_values(torch.from_numpy(X_mlp))
+                if mlp_shap_accum is None:
+                    mlp_shap_accum = [np.array(s) for s in sv]
+                else:
+                    for cc in range(len(sv)):
+                        mlp_shap_accum[cc] = mlp_shap_accum[cc] + np.array(sv[cc])
+            mlp_shap_all = [s / float(len(mlp_for_shap)) for s in mlp_shap_accum]
+            print(f"MLP SHAP done -- {len(mlp_shap_all)} classes "
+                  f"(avg over {len(mlp_for_shap)} nets)")
+
+            # A blank clinical field is now missing (NaN in X_xgb, 0 in X_mlp), so
+            # it is correctly excluded here -- only features the user actually set
+            # (nonzero) show up in the per-class SHAP breakdown.
+            inputted_mask = X_mlp[0] != 0
             inputted_indices = np.where(inputted_mask)[0]
 
             for c in range(num_classes_local):
@@ -625,7 +579,7 @@ def predict():
                     xgb_shap_c = reshaped[c, :-1]
 
                 mlp_shap_c = np.array(mlp_shap_all[c][0])
-                ensemble_shap = 0.6 * xgb_shap_c + 0.4 * mlp_shap_c
+                ensemble_shap = XGB_WEIGHT * xgb_shap_c + MLP_WEIGHT * mlp_shap_c
 
                 if len(inputted_indices) == 0:
                     shap_by_class[cancer_name] = []
@@ -636,8 +590,6 @@ def predict():
                 shap_features_list = []
                 for i in top_indices:
                     fname = feature_columns[inputted_indices[i]]
-                    if fname == "IS_MUTATED":
-                        continue
                     shap_features_list.append({
                         "feature": fname,
                         "shap_value": float(inputted_shap[i])
@@ -668,12 +620,15 @@ def predict():
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)
-    print("OmniCUP + CIVIC Therapy Lookup Server")
+    print("OmniCUP Ensemble Prediction Server")
     print("=" * 60)
-    print(f"ensemble_info.pkl: {os.path.exists('ensemble_info.pkl')}")
-    print(f"label_encoder.pkl: {os.path.exists('label_encoder.pkl')}")
-    print(f"xgb_model.json: {os.path.exists('xgb_model.json')}")
-    print(f"mlp_model.pt: {os.path.exists('mlp_model.pt')}")
+    print(f"ensemble_info.pkl : {os.path.exists('ensemble_info.pkl')}")
+    print(f"label_encoder.pkl : {os.path.exists('label_encoder.pkl')}")
+    print(f"xgb_models/       : {os.path.isdir(XGB_DIR)} "
+          f"({len(xgb_models)} loaded)")
+    print(f"mlp_models/       : {os.path.isdir(MLP_DIR)} "
+          f"({len(mlp_models)} loaded)")
+    print(f"Blend             : XGB {XGB_WEIGHT:.2f} / MLP {MLP_WEIGHT:.2f}")
     print("=" * 60 + "\n")
     flush()
 

@@ -12,11 +12,6 @@
             <img src="logo.png" alt="OmniCUP" class="brand-logo">
         </div>
 
-        <div class="tabs">
-            <button class="tab-button active" onclick="switchTab('prediction', event)">Prediction</button>
-            <button class="tab-button" onclick="switchTab('therapy', event)">Therapy</button>
-        </div>
-
         <div id="statusMessage" class="status-message"></div>
         <div id="loading" class="loading"></div>
 
@@ -45,70 +40,50 @@
                 </div>
             </div>
 
-            <h2>Add Altered Gene</h2>
-            <div class="autocomplete-wrapper">
-                <input 
-                    type="text" 
-                    id="geneInput" 
-                    class="autocomplete-input" 
-                    placeholder="Start typing gene name (e.g., TP53, BRCA1)..."
-                    autocomplete="off">
-                <div id="geneList" class="autocomplete-list"></div>
-            </div>
-
             <h2>Gene Alterations</h2>
-            <div class="table-wrapper">
-                <table id="geneTable">
-                    <thead>
-                        <tr>
-                            <th>Gene Name</th>
-                            <th>
-                                <div class="info-wrapper">
-                                    <span>LOF</span>
-                                    <span class="info-icon">i</span>
-                                    <div class="info-tooltip">
-                                        Loss of Function:<br><br>
-                                        • Nonsense Mutation<br>
-                                        • Frame Shift Insertion<br>
-                                        • Frame Shift Deletion<br>
-                                        • Splice Site<br>
-                                        • Translation Start Site
-                                    </div>
-                                </div>
-                            </th>
-                            <th>
-                                <div class="info-wrapper">
-                                    <span>Non-LOF</span>
-                                    <span class="info-icon">i</span>
-                                    <div class="info-tooltip">
-                                        Non-Loss of Function:<br><br>
-                                        • Missense Mutation<br>
-                                        • In Frame Insertion<br>
-                                        • In Frame Deletion<br>
-                                        • Nonstop Mutation
-                                    </div>
-                                </div>
-                            </th>
-                            <th>CNA Amp</th>
-                            <th>CNA Del</th>
-                            <th>Fusion</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="geneTableBody">
-                        <tr class="empty-state">
-                            <td colspan="7">No genes added yet. Search and select a gene above.</td>
-                        </tr>
-                    </tbody>
-                </table>
+            <p class="section-hint">Type a gene, pick its alteration type, then click <strong>Add</strong>. Add as many as you like — multiple alterations on the same gene are fine. Each one appears as a chip below.</p>
+            <div class="alteration-builder">
+                <div class="autocomplete-wrapper alteration-gene">
+                    <input
+                        type="text"
+                        id="geneInput"
+                        class="autocomplete-input"
+                        placeholder="Gene (e.g., TP53, KRAS, ALK)..."
+                        autocomplete="off">
+                    <div id="geneList" class="autocomplete-list"></div>
+                </div>
+                <select id="alterationType" class="alteration-select">
+                    <optgroup label="Mutation">
+                        <option value="Missense_Mutation">Missense Mutation</option>
+                        <option value="Nonsense_Mutation">Nonsense Mutation</option>
+                        <option value="Frame_Shift_Ins">Frame Shift Insertion</option>
+                        <option value="Frame_Shift_Del">Frame Shift Deletion</option>
+                        <option value="Splice_Site">Splice Site</option>
+                        <option value="Translation_Start_Site">Translation Start Site</option>
+                        <option value="In_Frame_Ins">In-Frame Insertion</option>
+                        <option value="In_Frame_Del">In-Frame Deletion</option>
+                        <option value="Nonstop_Mutation">Nonstop Mutation</option>
+                    </optgroup>
+                    <optgroup label="Copy Number (CNA)">
+                        <option value="AMP">Amplification</option>
+                        <option value="DEL">Deletion</option>
+                    </optgroup>
+                    <optgroup label="Structural">
+                        <option value="FUSION">Fusion</option>
+                    </optgroup>
+                </select>
+                <button class="btn btn-add-alteration" onclick="addAlteration()">Add</button>
+            </div>
+            <div id="alterationBadges" class="alteration-list">
+                <span class="empty-state">No alterations added yet.</span>
             </div>
 
             <h2>Allele-Level Hotspots</h2>
             <div class="autocomplete-wrapper">
-                <input 
-                    type="text" 
-                    id="hotspotInput" 
-                    class="autocomplete-input" 
+                <input
+                    type="text"
+                    id="hotspotInput"
+                    class="autocomplete-input"
                     placeholder="Search hotspot (e.g., TP53.R175H, KRAS.G12C)..."
                     autocomplete="off">
                 <div id="hotspotList" class="autocomplete-list"></div>
@@ -125,44 +100,12 @@
             <div class="divider"></div>
             <h2>Predictions</h2>
             <button class="btn btn-primary" onclick="submitData()">Get Tumor Origin Prediction</button>
-            
+
             <div id="resultsContainer" style="display: none;">
                 <div class="summary">
                     <h3>Top Predictions</h3>
                     <div id="predictionsList"></div>
                 </div>
-            </div>
-        </div>
-
-        <div id="therapy-tab" class="tab-content">
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="therapyGene">Gene</label>
-                    <input type="text" id="therapyGene" placeholder="Please enter the gene">
-                </div>
-                <div class="form-group">
-                    <label for="therapyCancerType">Cancer Type</label>
-                    <input type="text" id="therapyCancerType" placeholder="Please enter the cancer type">
-                </div>
-            </div>
-            
-            <div style="text-align: center; margin-top: 24px;">
-                <button class="btn btn-primary" onclick="submitTherapyLookup()">Search Therapies</button>
-            </div>
-            
-            <div id="therapyResultsContainer" style="display: none; margin-top: 24px;">
-                <div class="summary">
-                    <h3>Therapies from CIVIC Database</h3>
-                    <div id="therapyResults"></div>
-                </div>
-            </div>
-            
-            <div id="therapyLoadingContainer" style="display: none; text-align: center; margin-top: 24px;">
-                <div class="loading show"></div>
-            </div>
-            
-            <div id="therapyErrorContainer" style="display: none; margin-top: 24px;">
-                <div class="status-message error" id="therapyErrorMessage"></div>
             </div>
         </div>
     </div>

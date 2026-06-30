@@ -1,43 +1,24 @@
-function displayTherapyResults(result) {
-    const container = document.getElementById('therapyResults');
-    const resultsContainer = document.getElementById('therapyResultsContainer');
-    
-    container.innerHTML = '';
-    
-    console.log('Full result from backend:', result);
-    
-    let outputText = result.clinical_analysis || result.raw_query_response || 'No analysis available.';
-    
-    const resultDiv = document.createElement('div');
-    resultDiv.className = 'therapy-result-text';
-    resultDiv.style.cssText = `
-        background: #f9fafb;
-        border: 1px solid #d1d5db;
-        border-radius: 8px;
-        padding: 20px;
-        font-size: 13px;
-        line-height: 1.7;
-        color: #111827;
-        white-space: pre-wrap;
-        word-break: break-word;
-        font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
-        max-height: 900px;
-        overflow-y: auto;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
-    `;
-    resultDiv.textContent = outputText;
-    
-    container.appendChild(resultDiv);
-    resultsContainer.style.display = 'block';
-    
-    setTimeout(() => {
-        resultsContainer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }, 100);
-}
-
 let GENE_OPTIONS = [];
 let HOTSPOT_FEATURES = [];
 let ENSEMBLE_WEIGHTS = {};
+
+// Alteration value (model key) -> human label shown on the chip / dropdown.
+const ALTERATION_LABELS = {
+    ANY_SOM_MAT: 'Any Somatic Mutation',
+    Missense_Mutation: 'Missense Mutation',
+    Nonsense_Mutation: 'Nonsense Mutation',
+    Frame_Shift_Ins: 'Frame Shift Insertion',
+    Frame_Shift_Del: 'Frame Shift Deletion',
+    Splice_Site: 'Splice Site',
+    Translation_Start_Site: 'Translation Start Site',
+    In_Frame_Ins: 'In-Frame Insertion',
+    In_Frame_Del: 'In-Frame Deletion',
+    Nonstop_Mutation: 'Nonstop Mutation',
+    AMP: 'Amplification',
+    DEL: 'Deletion',
+    ANY_CNA: 'Any CNA',
+    FUSION: 'Fusion'
+};
 
 const DMETS_UI_TO_MODEL = {
     "Distant Lymph Nodes": "DMETS_DX_DIST_LN",
@@ -66,7 +47,7 @@ const DMETS_UI_TO_MODEL = {
 const DMETS_SITES = Object.keys(DMETS_UI_TO_MODEL);
 
 const state = {
-    genes: [],
+    alterations: [],          // [{ gene, type, label }]
     hotspots: new Set(),
     dmets: {}
 };
@@ -79,28 +60,25 @@ async function loadData() {
     try {
         const response = await fetch('/api/data');
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        
+
         const data = await response.json();
         GENE_OPTIONS = data.genes;
         HOTSPOT_FEATURES = data.hotspots;
         ENSEMBLE_WEIGHTS = data.ensemble_weights;
-        
-        setupAutocomplete('geneInput', 'geneList', GENE_OPTIONS, addGene);
+
+        // Gene picker just fills the input; the user then chooses a type + Add.
+        setupAutocomplete('geneInput', 'geneList', GENE_OPTIONS, (g) => {
+            document.getElementById('geneInput').value = g;
+            document.getElementById('alterationType').focus();
+        }, false);
+
         setupAutocomplete('hotspotInput', 'hotspotList', HOTSPOT_FEATURES, addHotspot);
-        
+
         renderDmets();
     } catch (error) {
         console.error('Failed to load data:', error);
         showStatus('Error loading data from server: ' + error.message, 'error');
     }
-}
-
-function switchTab(tabName, e) {
-    e.preventDefault();
-    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
-    document.getElementById(tabName + '-tab').classList.add('active');
-    e.currentTarget.classList.add('active');
 }
 
 function showStatus(message, type) {
@@ -114,18 +92,7 @@ function showLoading(show) {
     document.getElementById('loading').classList.toggle('show', show);
 }
 
-function showTherapyLoading(show) {
-    document.getElementById('therapyLoadingContainer').style.display = show ? 'block' : 'none';
-}
-
-function showTherapyError(message) {
-    const errorContainer = document.getElementById('therapyErrorContainer');
-    document.getElementById('therapyErrorMessage').textContent = message;
-    errorContainer.style.display = 'block';
-    setTimeout(() => { errorContainer.style.display = 'none'; }, 5000);
-}
-
-function setupAutocomplete(inputId, listId, options, callback) {
+function setupAutocomplete(inputId, listId, options, callback, clearOnSelect = true) {
     const input = document.getElementById(inputId);
     const list = document.getElementById(listId);
 
@@ -142,7 +109,7 @@ function setupAutocomplete(inputId, listId, options, callback) {
             item.textContent = option;
             item.addEventListener('click', function() {
                 callback(option);
-                input.value = '';
+                if (clearOnSelect) input.value = '';
                 list.style.display = 'none';
             });
             list.appendChild(item);
@@ -155,50 +122,72 @@ function setupAutocomplete(inputId, listId, options, callback) {
     });
 }
 
-function addGene(gene) {
-    state.genes.push({ name: gene, LOF: false, NON_LOF: false, AMP: false, DEL: false, FUSION: false });
-    renderGeneTable();
-    updateSummary();
-}
+// ============================================================
+// GENE-ALTERATION BUILDER
+// ============================================================
+function addAlteration() {
+    const geneInput = document.getElementById('geneInput');
+    const typeSelect = document.getElementById('alterationType');
+    const gene = geneInput.value.trim().toUpperCase();
+    const type = typeSelect.value;
 
-function removeGene(index) {
-    state.genes.splice(index, 1);
-    renderGeneTable();
-    updateSummary();
-}
-
-function renderGeneTable() {
-    const tbody = document.getElementById('geneTableBody');
-    if (state.genes.length === 0) {
-        tbody.innerHTML = '<tr class="empty-state"><td colspan="7">No genes added yet. Search and select a gene above.</td></tr>';
+    if (!gene) {
+        showStatus('Enter a gene before adding an alteration.', 'error');
         return;
     }
-    tbody.innerHTML = '';
-    state.genes.forEach((geneData, index) => {
-        const row = document.createElement('tr');
-        row.innerHTML = `
-            <td><strong>${geneData.name}</strong></td>
-            <td class="checkbox-cell"><input type="checkbox" ${geneData.LOF ? 'checked' : ''} onchange="updateGeneAlteration(${index}, 'LOF', this.checked)"></td>
-            <td class="checkbox-cell"><input type="checkbox" ${geneData.NON_LOF ? 'checked' : ''} onchange="updateGeneAlteration(${index}, 'NON_LOF', this.checked)"></td>
-            <td class="checkbox-cell"><input type="checkbox" ${geneData.AMP ? 'checked' : ''} onchange="updateGeneAlteration(${index}, 'AMP', this.checked)"></td>
-            <td class="checkbox-cell"><input type="checkbox" ${geneData.DEL ? 'checked' : ''} onchange="updateGeneAlteration(${index}, 'DEL', this.checked)"></td>
-            <td class="checkbox-cell"><input type="checkbox" ${geneData.FUSION ? 'checked' : ''} onchange="updateGeneAlteration(${index}, 'FUSION', this.checked)"></td>
-            <td style="text-align:center;"><button class="btn btn-remove" onclick="removeGene(${index})">Remove</button></td>
+
+    // Only genes the model actually has a feature column for are useful.
+    if (GENE_OPTIONS.length && !GENE_OPTIONS.includes(gene)) {
+        showStatus(`"${gene}" is not in the model's gene list. Pick one from the suggestions.`, 'error');
+        return;
+    }
+
+    const exists = state.alterations.some(a => a.gene === gene && a.type === type);
+    if (exists) {
+        showStatus(`${gene} · ${ALTERATION_LABELS[type] || type} is already added.`, 'error');
+        return;
+    }
+
+    state.alterations.push({ gene, type, label: ALTERATION_LABELS[type] || type });
+    geneInput.value = '';
+    renderAlterations();
+    updateSummary();
+}
+
+function removeAlteration(index) {
+    state.alterations.splice(index, 1);
+    renderAlterations();
+    updateSummary();
+}
+
+function renderAlterations() {
+    const container = document.getElementById('alterationBadges');
+    if (state.alterations.length === 0) {
+        container.innerHTML = '<span class="empty-state">No alterations added yet.</span>';
+        return;
+    }
+    container.innerHTML = '';
+    state.alterations.forEach((a, index) => {
+        const badge = document.createElement('span');
+        badge.className = 'alteration-badge';
+        badge.innerHTML = `
+            <span class="alt-gene">${a.gene}</span>
+            <span class="alt-sep">·</span>
+            <span class="alt-type">${a.label}</span>
+            <span class="badge-close" onclick="removeAlteration(${index})">✕</span>
         `;
-        tbody.appendChild(row);
+        container.appendChild(badge);
     });
 }
 
-function updateGeneAlteration(index, type, checked) {
-    const geneData = state.genes[index];
-    if (checked) {
-        Object.keys(geneData).forEach(key => { if (key !== 'name') geneData[key] = false; });
-        geneData[type] = true;
-    } else {
-        geneData[type] = false;
-    }
-    renderGeneTable();
-    updateSummary();
+// Collapse the flat alteration list into { gene: { TYPE: true, ... } }.
+function buildGenesPayload() {
+    const genesObj = {};
+    state.alterations.forEach(a => {
+        if (!genesObj[a.gene]) genesObj[a.gene] = {};
+        genesObj[a.gene][a.type] = true;
+    });
+    return genesObj;
 }
 
 function renderDmets() {
@@ -263,14 +252,6 @@ function updateSummary() {
         }
     });
 
-    const genesObj = {};
-    state.genes.forEach(geneData => {
-        genesObj[geneData.name] = {
-            LOF: geneData.LOF, NON_LOF: geneData.NON_LOF,
-            AMP: geneData.AMP, DEL: geneData.DEL, FUSION: geneData.FUSION
-        };
-    });
-
     const data = {
         Clinical: {
             Age: document.getElementById('age').value || null,
@@ -278,7 +259,7 @@ function updateSummary() {
             TMB: document.getElementById('tmb').value || null,
             MSI: document.getElementById('msi').value || null
         },
-        Genes: genesObj,
+        Genes: buildGenesPayload(),
         Hotspots: Array.from(state.hotspots).sort(),
         DMETS: modelDmets
     };
@@ -286,8 +267,12 @@ function updateSummary() {
 }
 
 function submitData() {
-    if (state.genes.length === 0) {
-        showStatus('Please add at least one gene before submitting.', 'error');
+    const hasAlteration = state.alterations.length > 0;
+    const hasHotspot = state.hotspots.size > 0;
+    const hasDmet = Object.values(state.dmets).some(Boolean);
+
+    if (!hasAlteration && !hasHotspot && !hasDmet) {
+        showStatus('Add at least one gene alteration, hotspot, or metastatic site before submitting.', 'error');
         return;
     }
 
@@ -297,14 +282,6 @@ function submitData() {
             const modelName = DMETS_UI_TO_MODEL[uiName];
             if (modelName) modelDmets[modelName] = 1;
         }
-    });
-
-    const genesObj = {};
-    state.genes.forEach(geneData => {
-        genesObj[geneData.name] = {
-            LOF: geneData.LOF, NON_LOF: geneData.NON_LOF,
-            AMP: geneData.AMP, DEL: geneData.DEL, FUSION: geneData.FUSION
-        };
     });
 
     const getClinicalValue = (id) => {
@@ -319,7 +296,7 @@ function submitData() {
             TMB: getClinicalValue('tmb'),
             MSI: getClinicalValue('msi')
         },
-        Genes: genesObj,
+        Genes: buildGenesPayload(),
         Hotspots: Array.from(state.hotspots).sort(),
         DMETS: modelDmets
     };
@@ -551,52 +528,24 @@ function showShapPanel(cancerType, confidence) {
     shapPanel.appendChild(card);
 }
 
-function submitTherapyLookup() {
-    const gene = document.getElementById('therapyGene').value.trim();
-    const cancerType = document.getElementById('therapyCancerType').value.trim();
-
-    document.getElementById('therapyResultsContainer').style.display = 'none';
-    document.getElementById('therapyErrorContainer').style.display = 'none';
-
-    if (!gene || !cancerType) {
-        showTherapyError('Please enter both gene and cancer type');
-        return;
-    }
-
-    console.log('Submitting therapy lookup:', { gene, cancerType });
-    showTherapyLoading(true);
-
-    fetch('/api/therapy-lookup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gene, cancer_type: cancerType })
-    })
-    .then(response => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json();
-    })
-    .then(result => {
-        showTherapyLoading(false);
-        console.log('Therapy lookup result:', result);
-        if (result.status === 'success') {
-            displayTherapyResults(result);
-        } else {
-            showTherapyError(`Error: ${result.message}`);
-        }
-    })
-    .catch(error => {
-        showTherapyLoading(false);
-        showTherapyError(`Error: ${error.message}`);
-        console.error('Therapy lookup error:', error);
-    });
-}
-
 document.addEventListener('DOMContentLoaded', function() {
     loadData();
     ['age', 'sex', 'tmb', 'msi'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('change', updateSummary);
     });
+
+    // Enter inside the gene box adds the currently selected alteration type.
+    const gi = document.getElementById('geneInput');
+    if (gi) {
+        gi.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                addAlteration();
+            }
+        });
+    }
+
     updateSummary();
 });
 
