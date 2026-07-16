@@ -10,7 +10,6 @@ Combining 10 neural networks with 10 XGBoost models, the framework has been exte
 [Read the paper](https://drive.google.com/file/d/1LfIgeSVCdTYQ-2yEE7zrdYnzlhq3BiOC/view?usp=sharing)
 
 **OmniCUP: A Biologically Interpretable Hybrid Ensemble Framework for Primary-Site Prediction in Cancer of Unknown Primary Using Routine-Care Next-Generation Sequencing Data**
-Saicharan Vellanki (Issaquah High School), Paraic Kenny (Gundersen Medical Foundation)
 
 ## Web Application
 The live web application can be accessed at: https://omnicup.live/
