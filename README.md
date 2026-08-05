@@ -7,7 +7,7 @@ OmniCUP is a hybrid ensemble machine learning framework designed to infer the mo
 Combining 10 neural networks with 10 XGBoost models, the framework has been externally validated using an independent precision oncology cohort and deployed as a real-time, interpretable web application.
 
 ## Paper
-[Read the paper](https://drive.google.com/file/d/1LfIgeSVCdTYQ-2yEE7zrdYnzlhq3BiOC/view?usp=sharing)
+Currently in review
 
 **OmniCUP: A Biologically Interpretable Hybrid Ensemble Framework for Primary-Site Prediction in Cancer of Unknown Primary Using Routine-Care Next-Generation Sequencing Data**
 
