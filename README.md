@@ -57,18 +57,6 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Authors
-
-* Saicharan Vellanki — Issaquah High School
-* Paraic Kenny, PhD — Gundersen Medical Foundation
-
-## Contact
-
-* [saivellanki10@gmail.com](mailto:saivellanki10@gmail.com)
-* [pakenny@emplifyhealth.org](mailto:pakenny@emplifyhealth.org)
-
-## Acknowledgment
-The authors thank the Gundersen Medical Foundation for its collaboration on external validation and for providing access to the Precision Oncology Cohort used in this study.
 
 ## License
 
